@@ -1,0 +1,11 @@
+## Interface: 50504, 50503
+## Title: Dynastia Raid Tools
+## Notes: Guild and raid notes for Dynastia
+## Notes-ruRU: Заметки гильдии и рейда для Dynastia
+## Author: Dynastia
+## Version: 1.0.0
+## SavedVariables: DRTDB
+## IconTexture: Interface\AddOns\DRT\media\GuildCrest.tga
+## AddonCompartmentFunc: DRT_Toggle
+
+Core.lua
