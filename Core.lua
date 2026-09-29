@@ -1,19 +1,15 @@
-local ADDON_NAME = ...
-
 local DRT = CreateFrame("Frame", "DRTEventFrame")
 _G.DRT = DRT
 
-local PREFIX = "DRT"
-local VERSION = "1.0.0"
+local PREFIX = "DRT2"
+local VERSION = "2.0.0"
 local CHUNK_SIZE = 170
-local NOTE_KEY_SEPARATOR = "\030"
-local MAIN_KEY = "__main"
 local LINK_WRAP_START = "<<<<<<<<<<<<<<<<<<<<<<<<<"
 local LINK_WRAP_END = ">>>>>>>>>>>>>>>>>>>>>>>>>"
-local MAIN_NOTE_WINDOW_DEFAULT_WIDTH = 300
-local MAIN_NOTE_WINDOW_DEFAULT_HEIGHT = 150
-local MAIN_NOTE_WINDOW_MIN_WIDTH = 80
-local MAIN_NOTE_WINDOW_MIN_HEIGHT = 42
+local NOTE_WINDOW_DEFAULT_WIDTH = 300
+local NOTE_WINDOW_DEFAULT_HEIGHT = 150
+local NOTE_WINDOW_MIN_WIDTH = 80
+local NOTE_WINDOW_MIN_HEIGHT = 42
 local MINIMAP_ICON_TEXTURE = "Interface\\AddOns\\DRT\\media\\GuildCrest.tga"
 
 local SendAddonMessage = C_ChatInfo and C_ChatInfo.SendAddonMessage or SendAddonMessage
@@ -25,7 +21,6 @@ local ceil = math.ceil
 local min = math.min
 local max = math.max
 local abs = math.abs
-local random = math.random
 local tinsert = table.insert
 local tremove = table.remove
 local sort = table.sort
@@ -37,8 +32,7 @@ DRT.markerButtons = {}
 DRT.incomingChunks = {}
 DRT.outgoingQueue = {}
 DRT.outgoingScheduled = false
-DRT.wasGrouped = nil
-DRT.selectedKey = MAIN_KEY
+DRT.selectedKey = nil
 DRT.playerFullName = nil
 DRT.realmName = nil
 
@@ -93,17 +87,7 @@ local function NormalizeRealm(realm)
 end
 
 local function NormalizeFullName(name, realm)
-	if not name or name == "" then
-		return nil
-	end
-	if name:find("-", 1, true) then
-		return name
-	end
-	realm = NormalizeRealm(realm or DRT.realmName)
-	if realm ~= "" then
-		return name .. "-" .. realm
-	end
-	return name
+	return DRTNotes.NormalizeName(name, realm and realm ~= "" and realm or DRT.realmName or GetRealmName())
 end
 
 local function UnitFullNameSafe(unit)
@@ -121,220 +105,23 @@ local function ShortName(fullName)
 	return (fullName:gsub("%-.+$", ""))
 end
 
-local function NoteKey(owner, id)
-	return tostring(owner or "") .. NOTE_KEY_SEPARATOR .. tostring(id or "")
-end
-
 local function CurrentMillis()
 	return (time() * 1000) + floor((GetTime() * 1000) % 1000)
 end
 
 local function EnsureDB()
-	DRTDB = DRTDB or {}
-	DRTDB.notes = DRTDB.notes or {}
-	DRTDB.main = DRTDB.main or {}
-	DRTDB.main.text = DRTDB.main.text or ""
-	DRTDB.main.updated = tonumber(DRTDB.main.updated or 0) or 0
-	DRTDB.main.owner = DRTDB.main.owner or ""
-	DRTDB.minimap = DRTDB.minimap or {}
-	if DRTDB.minimap.angle == nil then
-		DRTDB.minimap.angle = 225
-	end
+	DRTDB = type(DRTDB) == "table" and DRTDB or {}
+	DRTDB.minimap = type(DRTDB.minimap) == "table" and DRTDB.minimap or {}
+	DRTDB.minimap.angle = tonumber(DRTDB.minimap.angle) or 225
 	DRTDB.wrapLinkedNote = DRTDB.wrapLinkedNote and true or false
-	DRTDB.mainWindow = DRTDB.mainWindow or {}
-	DRTDB.mainWindow.enabled = DRTDB.mainWindow.enabled and true or false
-	DRTDB.mainWindow.locked = DRTDB.mainWindow.locked and true or false
-	DRTDB.mainWindow.width = max(MAIN_NOTE_WINDOW_MIN_WIDTH, tonumber(DRTDB.mainWindow.width or MAIN_NOTE_WINDOW_DEFAULT_WIDTH) or MAIN_NOTE_WINDOW_DEFAULT_WIDTH)
-	DRTDB.mainWindow.height = max(MAIN_NOTE_WINDOW_MIN_HEIGHT, tonumber(DRTDB.mainWindow.height or MAIN_NOTE_WINDOW_DEFAULT_HEIGHT) or MAIN_NOTE_WINDOW_DEFAULT_HEIGHT)
-	DRTDB.mainWindow.left = tonumber(DRTDB.mainWindow.left)
-	DRTDB.mainWindow.top = tonumber(DRTDB.mainWindow.top)
-end
-
-local function Encode(value)
-	value = tostring(value or "")
-	return value:gsub("([^A-Za-z0-9_%.%-])", function(char)
-		return string.format("%%%02X", char:byte())
-	end)
-end
-
-local function Decode(value)
-	value = tostring(value or "")
-	return value:gsub("%%(%x%x)", function(hex)
-		return string.char(tonumber(hex, 16))
-	end)
-end
-
-local function BuildPayload(kind, ...)
-	local payload = tostring(kind or "") .. "|"
-	for i = 1, select("#", ...) do
-		local field = tostring(select(i, ...) or "")
-		payload = payload .. #field .. ":" .. field
-	end
-	return payload
-end
-
-local function ParsePayload(payload)
-	local splitAt = payload:find("|", 1, true)
-	if not splitAt then
-		return nil
-	end
-
-	local kind = payload:sub(1, splitAt - 1)
-	local fields = {}
-	local pos = splitAt + 1
-
-	while pos <= #payload do
-		local colon = payload:find(":", pos, true)
-		if not colon then
-			return nil
-		end
-
-		local len = tonumber(payload:sub(pos, colon - 1))
-		if not len then
-			return nil
-		end
-
-		local startPos = colon + 1
-		local endPos = startPos + len - 1
-		fields[#fields + 1] = payload:sub(startPos, endPos)
-		pos = endPos + 1
-	end
-
-	return kind, fields
-end
-
-local function SplitChunkMessage(message)
-	local tag, id, index, total, part = message:match("^([^|]*)|([^|]*)|([^|]*)|([^|]*)|(.*)$")
-	return tag, id, tonumber(index), tonumber(total), part
-end
-
-function DRT:ScheduleAddonFlush()
-	if self.outgoingScheduled then
-		return
-	end
-	self.outgoingScheduled = true
-	C_Timer.After(0.12, function()
-		DRT.outgoingScheduled = false
-		DRT:FlushAddonQueue()
-	end)
-end
-
-function DRT:QueueAddonMessage(message, channel, target)
-	if not SendAddonMessage or not channel then
-		return
-	end
-
-	self.outgoingQueue[#self.outgoingQueue + 1] = {
-		message = message,
-		channel = channel,
-		target = target,
-	}
-	self:ScheduleAddonFlush()
-end
-
-function DRT:FlushAddonQueue()
-	local sent = 0
-	while sent < 8 and #self.outgoingQueue > 0 do
-		local entry = tremove(self.outgoingQueue, 1)
-		if entry.target then
-			SendAddonMessage(PREFIX, entry.message, entry.channel, entry.target)
-		else
-			SendAddonMessage(PREFIX, entry.message, entry.channel)
-		end
-		sent = sent + 1
-	end
-
-	if #self.outgoingQueue > 0 then
-		self:ScheduleAddonFlush()
-	end
-end
-
-local function GetGroupChannel()
-	if LE_PARTY_CATEGORY_INSTANCE and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
-		return "INSTANCE_CHAT"
-	end
-	if IsInRaid() then
-		return "RAID"
-	end
-	if IsInGroup() then
-		return "PARTY"
-	end
-	return nil
-end
-
-local function GetBroadcastChannels()
-	local channels = {}
-	local groupChannel = GetGroupChannel()
-	if groupChannel then
-		channels[#channels + 1] = groupChannel
-	end
-	return channels
-end
-
-local function SendPayload(payload, channel, target)
-	if not SendAddonMessage or not channel then
-		return
-	end
-
-	local encoded = Encode(payload)
-	local total = max(1, ceil(#encoded / CHUNK_SIZE))
-	local id = tostring(CurrentMillis()) .. tostring(random(1000, 9999))
-
-	for index = 1, total do
-		local startPos = ((index - 1) * CHUNK_SIZE) + 1
-		local part = encoded:sub(startPos, startPos + CHUNK_SIZE - 1)
-		local message = "C|" .. id .. "|" .. index .. "|" .. total .. "|" .. part
-		DRT:QueueAddonMessage(message, channel, target)
-	end
-end
-
-local function BroadcastPayload(payload)
-	local channels = GetBroadcastChannels()
-	for i = 1, #channels do
-		SendPayload(payload, channels[i])
-	end
-end
-
-local function BuildNotePayload(note)
-	return BuildPayload(
-		"NOTE",
-		note.id or "",
-		note.owner or "",
-		tostring(note.updated or 0),
-		note.deleted and "1" or "0",
-		note.title or "",
-		note.body or ""
-	)
-end
-
-local function BuildMainPayload()
-	return BuildPayload(
-		"MAIN",
-		tostring(DRTDB.main.updated or 0),
-		DRTDB.main.owner or "",
-		DRTDB.main.text or ""
-	)
-end
-
-local function BuildOwnerNotesPayload(owner, ids)
-	return BuildPayload("OWNER", owner or "", table.concat(ids or {}, ","))
 end
 
 local function IsOwnNote(note)
-	return note and note.owner == DRT.playerFullName
+	return DRT.store and DRT.store:Own(note) or false
 end
 
 local function IsSamePlayerName(a, b)
-	if not a or not b then
-		return false
-	end
-	if a == b then
-		return true
-	end
-	if Ambiguate then
-		return Ambiguate(a, "none") == Ambiguate(b, "none")
-	end
-	return false
+	return a ~= nil and b ~= nil and NormalizeFullName(a) == NormalizeFullName(b)
 end
 
 local function IsCurrentGroupMember(fullName)
@@ -368,17 +155,8 @@ local function IsCurrentGroupMember(fullName)
 	return false
 end
 
-local function ShouldKeepRemoteNote(note)
-	return IsOwnNote(note) or IsCurrentGroupMember(note and note.owner)
-end
-
 local function CompareNotes(a, b)
-	if a.isMain then
-		return true
-	end
-	if b.isMain then
-		return false
-	end
+	if IsOwnNote(a) ~= IsOwnNote(b) then return IsOwnNote(a) end
 
 	local ownerA = ShortName(a.owner):lower()
 	local ownerB = ShortName(b.owner):lower()
@@ -396,46 +174,15 @@ local function CompareNotes(a, b)
 end
 
 function DRT:RebuildNotesList()
-	wipe(self.notesList)
-	self.notesList[#self.notesList + 1] = {
-		key = MAIN_KEY,
-		isMain = true,
-		title = "Главная заметка",
-		owner = DRTDB.main.owner or "",
-		body = DRTDB.main.text or "",
-		updated = DRTDB.main.updated or 0,
-	}
-
-	for key, note in pairs(DRTDB.notes) do
-		if type(note) == "table" and not note.deleted and ShouldKeepRemoteNote(note) then
-			note.key = key
-			self.notesList[#self.notesList + 1] = note
-		end
-	end
-
+	self.notesList = self.store:List()
+	for _, note in ipairs(self.notesList) do note.key = self.store:Key(note) end
 	sort(self.notesList, CompareNotes)
 end
 
-function DRT:PruneForeignNotes(onlyUnavailable)
-	local changed = false
-	for key, note in pairs(DRTDB.notes) do
-		if type(note) == "table" and note.deleted == false then
-			note.deleted = nil
-			changed = true
-		end
-		local shouldRemove = type(note) ~= "table" or note.deleted
-		if not shouldRemove and not IsOwnNote(note) then
-			shouldRemove = (not onlyUnavailable) or (not IsCurrentGroupMember(note.owner))
-		end
-		if shouldRemove then
-			DRTDB.notes[key] = nil
-			changed = true
-			if self.selectedKey == key then
-				self.selectedKey = MAIN_KEY
-			end
-		end
-	end
-	return changed
+function DRT:PruneForeignNotes()
+	if not self.store then return end
+	self.store:Prune(IsCurrentGroupMember)
+	self:UpdateNoteWindow()
 end
 
 local function CreateFont(parent, template, text, justify)
@@ -567,13 +314,14 @@ local function FormatTextForDisplay(text)
 	return text
 end
 
-function DRT:UpdateMainNoteWindowText()
-	local frame = self.mainNoteWindow
-	if not frame then
+function DRT:UpdateNoteWindowText()
+	local frame = self.noteWindow
+	if not frame or not frame.content then
 		return
 	end
 
-	local text = FormatTextForDisplay(DRTDB.main.text or "")
+	local note = self.store:Get(DRTDB.noteWindow.key)
+	local text = FormatTextForDisplay(note and note.body or "")
 	if Trim(text) == "" then
 		text = " "
 	end
@@ -582,27 +330,28 @@ function DRT:UpdateMainNoteWindowText()
 	frame.text:SetText(text)
 	local textHeight = frame.text:GetStringHeight() or 0
 	frame.content:SetHeight(max(frame.scroll:GetHeight(), textHeight + 12))
+	frame.scroll:SetVerticalScroll(min(frame.scroll:GetVerticalScroll(), max(0, frame.content:GetHeight() - frame.scroll:GetHeight())))
 end
 
-function DRT:SaveMainNoteWindowPosition()
-	local frame = self.mainNoteWindow
-	if not frame or not DRTDB or not DRTDB.mainWindow then
+function DRT:SaveNoteWindowPosition()
+	local frame = self.noteWindow
+	if not frame or not DRTDB or not DRTDB.noteWindow then
 		return
 	end
-	DRTDB.mainWindow.left = frame:GetLeft()
-	DRTDB.mainWindow.top = frame:GetTop()
+	DRTDB.noteWindow.left = frame:GetLeft()
+	DRTDB.noteWindow.top = frame:GetTop()
 end
 
-function DRT:CreateMainNoteWindow()
-	if self.mainNoteWindow then
+function DRT:CreateNoteWindow()
+	if self.noteWindow then
 		return
 	end
 
-	local frame = CreateFrame("Frame", "DRTMainNoteWindow", UIParent, BackdropTemplateMixin and "BackdropTemplate")
-	self.mainNoteWindow = frame
-	frame:SetSize(DRTDB.mainWindow.width or MAIN_NOTE_WINDOW_DEFAULT_WIDTH, DRTDB.mainWindow.height or MAIN_NOTE_WINDOW_DEFAULT_HEIGHT)
-	if DRTDB.mainWindow.left and DRTDB.mainWindow.top then
-		frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", DRTDB.mainWindow.left, DRTDB.mainWindow.top)
+	local frame = CreateFrame("Frame", "DRTNoteWindow", UIParent, BackdropTemplateMixin and "BackdropTemplate")
+	self.noteWindow = frame
+	frame:SetSize(DRTDB.noteWindow.width or NOTE_WINDOW_DEFAULT_WIDTH, DRTDB.noteWindow.height or NOTE_WINDOW_DEFAULT_HEIGHT)
+	if DRTDB.noteWindow.left and DRTDB.noteWindow.top then
+		frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", DRTDB.noteWindow.left, DRTDB.noteWindow.top)
 	else
 		frame:SetPoint("TOPLEFT", UIParent, "CENTER", -150, 180)
 	end
@@ -613,9 +362,9 @@ function DRT:CreateMainNoteWindow()
 	frame:RegisterForDrag("LeftButton")
 	frame:EnableMouse(true)
 	if frame.SetResizeBounds then
-		frame:SetResizeBounds(MAIN_NOTE_WINDOW_MIN_WIDTH, MAIN_NOTE_WINDOW_MIN_HEIGHT, 800, 600)
+		frame:SetResizeBounds(NOTE_WINDOW_MIN_WIDTH, NOTE_WINDOW_MIN_HEIGHT, 800, 600)
 	elseif frame.SetMinResize then
-		frame:SetMinResize(MAIN_NOTE_WINDOW_MIN_WIDTH, MAIN_NOTE_WINDOW_MIN_HEIGHT)
+		frame:SetMinResize(NOTE_WINDOW_MIN_WIDTH, NOTE_WINDOW_MIN_HEIGHT)
 	end
 	frame:Hide()
 	SetPanelBackdrop(frame)
@@ -630,14 +379,14 @@ function DRT:CreateMainNoteWindow()
 	end)
 	frame:SetScript("OnDragStop", function(self)
 		self:StopMovingOrSizing()
-		DRT:SaveMainNoteWindowPosition()
+		DRT:SaveNoteWindowPosition()
 	end)
 	frame:SetScript("OnSizeChanged", function(self, width, height)
-		if DRTDB and DRTDB.mainWindow then
-			DRTDB.mainWindow.width = width
-			DRTDB.mainWindow.height = height
+		if DRTDB and DRTDB.noteWindow then
+			DRTDB.noteWindow.width = width
+			DRTDB.noteWindow.height = height
 		end
-		DRT:UpdateMainNoteWindowText()
+		DRT:UpdateNoteWindowText()
 	end)
 
 	local scroll = CreateFrame("ScrollFrame", nil, frame)
@@ -647,7 +396,7 @@ function DRT:CreateMainNoteWindow()
 	frame.scroll = scroll
 
 	local content = CreateFrame("Frame", nil, scroll)
-	content:SetSize(MAIN_NOTE_WINDOW_DEFAULT_WIDTH - 16, MAIN_NOTE_WINDOW_DEFAULT_HEIGHT - 24)
+	content:SetSize(NOTE_WINDOW_DEFAULT_WIDTH - 16, NOTE_WINDOW_DEFAULT_HEIGHT - 24)
 	scroll:SetScrollChild(content)
 	frame.content = content
 
@@ -679,43 +428,36 @@ function DRT:CreateMainNoteWindow()
 	resize:SetPushedTexture("Interface\\CHATFRAME\\UI-ChatIM-SizeGrabber-Down")
 	resize:SetHighlightTexture("Interface\\CHATFRAME\\UI-ChatIM-SizeGrabber-Highlight")
 	resize:SetScript("OnMouseDown", function()
-		if not DRTDB.mainWindow.locked then
+		if not DRTDB.noteWindow.locked then
 			frame:StartSizing()
 		end
 	end)
 	resize:SetScript("OnMouseUp", function()
 		frame:StopMovingOrSizing()
-		DRT:SaveMainNoteWindowPosition()
+		DRT:SaveNoteWindowPosition()
 	end)
 	frame.resizeButton = resize
 end
 
-function DRT:RefreshMainNoteControls(isMain)
-	if not self.mainWindowShowCheck then
-		return
-	end
-
-	SetFrameShown(self.mainWindowShowCheck, isMain)
-	SetFrameShown(self.mainWindowShowCheck.label, isMain)
-	SetFrameShown(self.mainWindowLockCheck, isMain)
-	SetFrameShown(self.mainWindowLockCheck.label, isMain)
-
-	if isMain then
-		self.mainWindowShowCheck:SetChecked(DRTDB.mainWindow.enabled)
-		self.mainWindowLockCheck:SetChecked(DRTDB.mainWindow.locked)
-	end
+function DRT:RefreshNoteControls()
+	if not self.noteWindowShowCheck then return end
+	local note = self:GetSelectedNote()
+	self.noteWindowShowCheck:SetChecked(note and DRTDB.noteWindow.enabled and DRTDB.noteWindow.key == self.selectedKey)
+	self.noteWindowLockCheck:SetChecked(DRTDB.noteWindow.locked)
+	SetButtonEnabled(self.noteWindowShowCheck, note ~= nil)
+	SetButtonEnabled(self.noteWindowLockCheck, DRTDB.noteWindow.enabled)
 end
 
-function DRT:UpdateMainNoteWindow()
-	if not DRTDB or not DRTDB.mainWindow then
+function DRT:UpdateNoteWindow()
+	if not DRTDB or not DRTDB.noteWindow then
 		return
 	end
 
-	self:CreateMainNoteWindow()
-	self:UpdateMainNoteWindowText()
+	self:CreateNoteWindow()
+	self:UpdateNoteWindowText()
 
-	local frame = self.mainNoteWindow
-	local locked = DRTDB.mainWindow.locked and true or false
+	local frame = self.noteWindow
+	local locked = DRTDB.noteWindow.locked and true or false
 	frame:SetMovable(not locked)
 	frame:EnableMouse(not locked)
 	if frame.SetResizable then
@@ -724,43 +466,33 @@ function DRT:UpdateMainNoteWindow()
 	frame.scroll:EnableMouseWheel(not locked)
 	SetFrameShown(frame.resizeButton, not locked)
 
-	if DRTDB.mainWindow.enabled then
+	if DRTDB.noteWindow.enabled and self.store:Get(DRTDB.noteWindow.key) then
 		frame:Show()
 	else
 		frame:Hide()
 	end
 
-	self:RefreshMainNoteControls(self.selectedKey == MAIN_KEY)
+	self:RefreshNoteControls()
 end
 
 function DRT:GetSelectedNote()
-	if self.selectedKey == MAIN_KEY then
-		return {
-			key = MAIN_KEY,
-			isMain = true,
-			title = "Главная заметка",
-			owner = DRTDB.main.owner or "",
-			body = DRTDB.main.text or "",
-			updated = DRTDB.main.updated or 0,
-		}
-	end
-	local note = DRTDB.notes[self.selectedKey]
-	if note and ShouldKeepRemoteNote(note) then
-		return note
-	end
-	return nil
+	return self.store and self.store:Get(self.selectedKey)
+end
+
+function DRT:CaptureDraft()
+	if self.loadingEditor or not self.titleEdit or not self.store then return end
+	local note = self.store:Get(self.editorKey)
+	if not IsOwnNote(note) then return end
+	self.store.drafts[self.editorKey] = { title = self.titleEdit:GetText(), body = self.bodyEdit:GetText() }
 end
 
 function DRT:SelectNote(key)
-	self.selectedKey = key or MAIN_KEY
+	self:CaptureDraft()
+	self.selectedKey = key
 	self:RefreshUI()
 end
 
 local function GetNoteDisplayTitle(note)
-	if note.isMain then
-		return "|cff55ee55Главная заметка|r"
-	end
-
 	local title = Trim(note.title)
 	if title == "" then
 		title = "Без названия"
@@ -768,7 +500,7 @@ local function GetNoteDisplayTitle(note)
 
 	local owner = ShortName(note.owner)
 	if IsOwnNote(note) then
-		return "|cff91ff91" .. title .. "|r |cff888888(" .. owner .. ")|r"
+		return "|cff91ff91" .. title .. "|r |cff888888(моя" .. (note.shared and "" or ", приватная") .. ")|r"
 	end
 	return title .. " |cff888888(" .. owner .. ")|r"
 end
@@ -807,9 +539,9 @@ function DRT:RefreshNotesList()
 					return
 				end
 				GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-				GameTooltip:AddLine(note.isMain and "Главная заметка" or (note.title ~= "" and note.title or "Без названия"))
+				GameTooltip:AddLine(note.title ~= "" and note.title or "Без названия")
 				if note.owner and note.owner ~= "" then
-					GameTooltip:AddLine("Автор: " .. ShortName(note.owner), 0.8, 0.8, 0.8)
+					GameTooltip:AddLine("Владелец: " .. note.owner, 0.8, 0.8, 0.8)
 				end
 				if note.updated and note.updated > 0 then
 					GameTooltip:AddLine(date("%d.%m.%Y %H:%M", floor(note.updated / 1000)), 0.8, 0.8, 0.8)
@@ -843,9 +575,9 @@ function DRT:RefreshNotesList()
 end
 
 function DRT:SetEditorEnabled(enabled)
-	SetEditBoxEnabled(self.titleEdit, enabled and self.selectedKey ~= MAIN_KEY)
+	SetEditBoxEnabled(self.titleEdit, enabled)
 	SetEditBoxEnabled(self.bodyEdit, enabled)
-	SetPanelBorder(self.titlePanel, false, not (enabled and self.selectedKey ~= MAIN_KEY))
+	SetPanelBorder(self.titlePanel, false, not (enabled))
 	SetPanelBorder(self.bodyPanel, false, not enabled)
 
 	if enabled then
@@ -856,42 +588,53 @@ function DRT:SetEditorEnabled(enabled)
 end
 
 function DRT:RefreshEditor()
-	if not self.frame then
-		return
-	end
-
+	if not self.frame then return end
 	local note = self:GetSelectedNote()
-	if not note then
-		self.selectedKey = MAIN_KEY
-		note = self:GetSelectedNote()
-	end
-
-	local canEdit = note.isMain or IsOwnNote(note)
-	local bodyText = note.isMain and (DRTDB.main.text or "") or (note.body or "")
-	self.titleEdit:SetText(note.isMain and "Главная заметка" or (note.title or ""))
-	self.bodyEdit:SetText(bodyText)
-	self.ownerText:SetText(note.isMain and "Синхронизируется в текущей группе/рейде" or ("Автор: " .. ShortName(note.owner)))
-
-	if note.updated and note.updated > 0 then
+	local canEdit = IsOwnNote(note)
+	local draft = self.store.drafts[self.selectedKey]
+	self.loadingEditor = true
+	self.editorKey = self.selectedKey
+	self.titleEdit:SetText(draft and draft.title or (note and note.title or ""))
+	self.bodyEdit:SetText(draft and draft.body or (note and note.body or ""))
+	self.loadingEditor = false
+	self.ownerText:SetText(note and ("Владелец: " .. note.owner .. (canEdit and " (моя заметка)" or " (расшаренная)")) or "")
+	if note and note.updated and note.updated > 0 then
 		self.updatedText:SetText("Обновлено: " .. date("%d.%m.%Y %H:%M:%S", floor(note.updated / 1000)))
 	else
 		self.updatedText:SetText("")
 	end
-
 	self:SetEditorEnabled(canEdit)
 	SetButtonEnabled(self.saveButton, canEdit)
-	SetButtonEnabled(self.deleteButton, (not note.isMain) and IsOwnNote(note))
-	SetButtonEnabled(self.toMainButton, not note.isMain)
-	self:RefreshMainNoteControls(note.isMain)
+	SetButtonEnabled(self.deleteButton, canEdit)
+	SetButtonEnabled(self.linkButton, note ~= nil)
+	SetButtonEnabled(self.shareCheck, canEdit)
+	SetFrameShown(self.shareCheck, canEdit)
+	SetFrameShown(self.shareCheck.label, canEdit)
+	self.shareCheck:SetChecked(note and note.shared)
+	self:RefreshNoteControls()
 end
 
 function DRT:RefreshUI()
-	if not self.frame then
-		return
+	if not self.frame or not self.store then return end
+	self:CaptureDraft()
+	self:RebuildNotesList()
+	if not self:GetSelectedNote() then
+		self.selectedKey = self.notesList[1] and self.notesList[1].key or nil
 	end
 	self:RefreshNotesList()
 	self:RefreshEditor()
 	self:RefreshPlayerButtons()
+end
+
+function DRT:RefreshRemoteUI()
+	self:UpdateNoteWindow()
+	if not self.frame or not self.frame:IsShown() then return end
+	-- Network/roster events must not reset text, focus or caret in a local editor.
+	if IsOwnNote(self:GetSelectedNote()) then
+		self:RefreshNotesList()
+	else
+		self:RefreshUI()
+	end
 end
 
 function DRT:InsertText(text)
@@ -1042,51 +785,31 @@ end
 
 function DRT:SaveSelected()
 	local note = self:GetSelectedNote()
-	if not note then
-		return
-	end
-
-	if note.isMain then
-		DRTDB.main.text = self.bodyEdit:GetText() or ""
-		DRTDB.main.owner = self.playerFullName
-		DRTDB.main.updated = CurrentMillis()
-		BroadcastPayload(BuildMainPayload())
-		self:RefreshUI()
-		self:UpdateMainNoteWindow()
-		Print("главная заметка обновлена.")
-		return
-	end
-
-	if not IsOwnNote(note) then
-		Print("можно редактировать только свои заметки.")
-		return
-	end
-
-	note.title = Trim(self.titleEdit:GetText())
-	note.body = self.bodyEdit:GetText() or ""
-	note.updated = CurrentMillis()
-	note.owner = self.playerFullName
-	note.deleted = nil
-	note.localOnly = nil
-
-	BroadcastPayload(BuildNotePayload(note))
+	if not IsOwnNote(note) then return end
+	local ok, err = self.store:Save(note, Trim(self.titleEdit:GetText()), self.bodyEdit:GetText() or "", CurrentMillis())
+	if not ok then Print(err or "Не удалось сохранить заметку."); return end
+	self.store.drafts[self.selectedKey] = nil
+	self.editorKey = nil
+	self:PublishNotes()
 	self:RefreshUI()
+	self:UpdateNoteWindow()
 	Print("заметка сохранена.")
 end
 
+function DRT:SetSelectedShared(shared)
+	local note = self:GetSelectedNote()
+	if not IsOwnNote(note) then return end
+	local ok, err = self.store:Share(note, shared, CurrentMillis())
+	if not ok then Print(err or "Не удалось изменить доступ."); end
+	self.shareCheck:SetChecked(note.shared)
+	self:PublishNotes()
+	self:RefreshNotesList()
+end
+
 function DRT:CreateNewNote()
-	local id = tostring(CurrentMillis()) .. tostring(random(1000, 9999))
-	local note = {
-		id = id,
-		owner = self.playerFullName,
-		title = "Новая заметка",
-		body = "",
-		updated = CurrentMillis(),
-		localOnly = true,
-	}
-	local key = NoteKey(note.owner, note.id)
-	DRTDB.notes[key] = note
-	self.selectedKey = key
+	self:CaptureDraft()
+	local note = self.store:Create(CurrentMillis())
+	self.selectedKey = self.store:Key(note)
 	self:RefreshUI()
 	self.titleEdit:SetFocus()
 	self.titleEdit:HighlightText()
@@ -1094,46 +817,12 @@ end
 
 function DRT:DeleteSelected()
 	local note = self:GetSelectedNote()
-	if not note or note.isMain then
-		return
-	end
-	if not IsOwnNote(note) then
-		Print("можно удалять только свои заметки.")
-		return
-	end
-
-	if not note.localOnly then
-		local deletePayload = {
-			id = note.id,
-			owner = note.owner,
-			updated = CurrentMillis(),
-			deleted = true,
-			title = note.title or "",
-			body = "",
-		}
-		BroadcastPayload(BuildNotePayload(deletePayload))
-	end
-
-	DRTDB.notes[self.selectedKey] = nil
-	self.selectedKey = MAIN_KEY
+	if not self.store:Delete(note, CurrentMillis()) then return end
+	self.editorKey, self.selectedKey = nil, nil
+	self:PublishNotes()
 	self:RefreshUI()
+	self:UpdateNoteWindow()
 	Print("заметка удалена.")
-end
-
-function DRT:MoveSelectedToMain()
-	local note = self:GetSelectedNote()
-	if not note or note.isMain then
-		return
-	end
-
-	DRTDB.main.text = note.body or ""
-	DRTDB.main.owner = self.playerFullName
-	DRTDB.main.updated = CurrentMillis()
-	BroadcastPayload(BuildMainPayload())
-	self.selectedKey = MAIN_KEY
-	self:RefreshUI()
-	self:UpdateMainNoteWindow()
-	Print("заметка перенесена в главную.")
 end
 
 local function SplitChatLine(line)
@@ -1152,6 +841,12 @@ local function SplitChatLine(line)
 				break
 			end
 		end
+		-- Do not split a UTF-8 codepoint or a raid-marker token.
+		local openToken = line:sub(1, cut):match(".*(){")
+		if openToken and not line:sub(openToken, cut):find("}", 1, true) and line:find("}", cut + 1, true) then
+			if openToken > 1 then cut = openToken - 1 end
+		end
+		while cut > 0 and line:byte(cut + 1) and line:byte(cut + 1) >= 128 and line:byte(cut + 1) < 192 do cut = cut - 1 end
 		chunks[#chunks + 1] = line:sub(1, cut)
 		line = Trim(line:sub(cut + 1))
 	end
@@ -1171,12 +866,7 @@ end
 
 function DRT:GetCurrentLinkText()
 	local note = self:GetSelectedNote()
-	if note and note.isMain then
-		return DRTDB.main.text or "", "главная заметка"
-	elseif note then
-		return note.body or "", "текущая заметка"
-	end
-	return DRTDB.main.text or "", "текущая заметка"
+	return note and note.body or "", "текущая заметка"
 end
 
 function DRT:LinkCurrentNote()
@@ -1190,12 +880,8 @@ function DRT:LinkCurrentNote()
 	end
 	local text = FormatTextForChat(rawText)
 
-	local channel
-	if IsInRaid() then
-		channel = "RAID"
-	elseif IsInGroup() then
-		channel = "PARTY"
-	else
+	local channel = self:GetGroupChannel()
+	if not channel then
 		Print("вы не в группе или рейде.")
 		return
 	end
@@ -1208,28 +894,14 @@ function DRT:LinkCurrentNote()
 		end
 	end
 
+	local generation = self.groupGeneration
 	for i = 1, #queue do
 		local message = queue[i]
 		C_Timer.After((i - 1) * 0.25, function()
-			SendChatMessage(message, channel)
+			if DRT.groupGeneration == generation and DRT:GetGroupChannel() == channel then
+				SendChatMessage(message, channel)
+			end
 		end)
-	end
-end
-
-function DRT:LinkMainNote()
-	self:LinkCurrentNote()
-end
-
-function DRT:ClearMainNote(shouldBroadcast)
-	DRTDB.main.text = ""
-	DRTDB.main.owner = self.playerFullName or ""
-	DRTDB.main.updated = CurrentMillis()
-	if shouldBroadcast then
-		BroadcastPayload(BuildMainPayload())
-	end
-	self:UpdateMainNoteWindow()
-	if self.selectedKey == MAIN_KEY then
-		self:RefreshUI()
 	end
 end
 
@@ -1358,6 +1030,7 @@ function DRT:CreateMainFrame()
 			titleEdit:SetFocus()
 		end
 	end)
+	titleEdit:SetScript("OnTextChanged", function() DRT:CaptureDraft() end)
 	self.titleEdit = titleEdit
 
 	local saveButton = CreateButton(frame, "Сохранить", 94, 23)
@@ -1367,52 +1040,57 @@ function DRT:CreateMainFrame()
 	end)
 	self.saveButton = saveButton
 
-	local toMainButton = CreateButton(frame, "В главную", 98, 23)
-	toMainButton:SetPoint("LEFT", saveButton, "RIGHT", 8, 0)
-	toMainButton:SetScript("OnClick", function()
-		DRT:MoveSelectedToMain()
+	local shareCheck = CreateCheckButton(frame, "DRTShareNoteCheckButton", "Шарить")
+	shareCheck:SetPoint("LEFT", saveButton, "RIGHT", 10, 0)
+	shareCheck:SetScript("OnClick", function(self)
+		DRT:SetSelectedShared(self:GetChecked())
 	end)
-	self.toMainButton = toMainButton
+	self.shareCheck = shareCheck
 
 	local ownerText = CreateFont(frame, "GameFontHighlightSmall", "", "LEFT")
 	ownerText:SetPoint("TOPLEFT", titlePanel, "BOTTOMLEFT", 0, -8)
+	ownerText:SetWidth(590)
+	ownerText:SetWordWrap(false)
 	ownerText:SetTextColor(0.78, 0.82, 0.86, 1)
 	self.ownerText = ownerText
 
 	local updatedText = CreateFont(frame, "GameFontHighlightSmall", "", "RIGHT")
-	updatedText:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -34, -122)
+	updatedText:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -34, -158)
 	updatedText:SetTextColor(0.58, 0.62, 0.66, 1)
 	self.updatedText = updatedText
 
-	local mainWindowShowCheck = CreateCheckButton(frame, "DRTShowMainNoteWindowCheckButton", "Показывать главную")
-	mainWindowShowCheck:SetPoint("TOPLEFT", titlePanel, "BOTTOMLEFT", -2, -26)
-	mainWindowShowCheck:SetScript("OnClick", function(self)
-		DRTDB.mainWindow.enabled = self:GetChecked() and true or false
-		DRT:UpdateMainNoteWindow()
+	local noteWindowShowCheck = CreateCheckButton(frame, "DRTShowNoteWindowCheckButton", "Показывать поверх UI")
+	noteWindowShowCheck:SetPoint("TOPLEFT", titlePanel, "BOTTOMLEFT", -2, -26)
+	noteWindowShowCheck:SetScript("OnClick", function(self)
+		DRTDB.noteWindow.enabled = self:GetChecked() and true or false
+		DRTDB.noteWindow.key = DRT.selectedKey
+		DRT.store.profile.windowKey = DRT.selectedKey
+		if DRT.noteWindow then DRT.noteWindow.scroll:SetVerticalScroll(0) end
+		DRT:UpdateNoteWindow()
 	end)
-	mainWindowShowCheck:SetScript("OnEnter", function(self)
+	noteWindowShowCheck:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
-		GameTooltip:AddLine("Показывать главную")
-		GameTooltip:AddLine("Открывает отдельное окно с главной заметкой поверх интерфейса.", 0.8, 0.8, 0.8)
+		GameTooltip:AddLine("Показывать поверх UI")
+		GameTooltip:AddLine("Показывает выбранную заметку в отдельном окне.", 0.8, 0.8, 0.8)
 		GameTooltip:Show()
 	end)
-	mainWindowShowCheck:SetScript("OnLeave", GameTooltip_Hide)
-	self.mainWindowShowCheck = mainWindowShowCheck
+	noteWindowShowCheck:SetScript("OnLeave", GameTooltip_Hide)
+	self.noteWindowShowCheck = noteWindowShowCheck
 
-	local mainWindowLockCheck = CreateCheckButton(frame, "DRTLockMainNoteWindowCheckButton", "Закрепить главную")
-	mainWindowLockCheck:SetPoint("TOPLEFT", titlePanel, "BOTTOMLEFT", 184, -26)
-	mainWindowLockCheck:SetScript("OnClick", function(self)
-		DRTDB.mainWindow.locked = self:GetChecked() and true or false
-		DRT:UpdateMainNoteWindow()
+	local noteWindowLockCheck = CreateCheckButton(frame, "DRTLockNoteWindowCheckButton", "Закрепить окно")
+	noteWindowLockCheck:SetPoint("TOPLEFT", titlePanel, "BOTTOMLEFT", 210, -26)
+	noteWindowLockCheck:SetScript("OnClick", function(self)
+		DRTDB.noteWindow.locked = self:GetChecked() and true or false
+		DRT:UpdateNoteWindow()
 	end)
-	mainWindowLockCheck:SetScript("OnEnter", function(self)
+	noteWindowLockCheck:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_TOP")
-		GameTooltip:AddLine("Закрепить главную")
-		GameTooltip:AddLine("Запрещает перемещать и изменять размер окна главной заметки.", 0.8, 0.8, 0.8)
+		GameTooltip:AddLine("Закрепить окно")
+		GameTooltip:AddLine("Запрещает перемещать и изменять размер окна заметки.", 0.8, 0.8, 0.8)
 		GameTooltip:Show()
 	end)
-	mainWindowLockCheck:SetScript("OnLeave", GameTooltip_Hide)
-	self.mainWindowLockCheck = mainWindowLockCheck
+	noteWindowLockCheck:SetScript("OnLeave", GameTooltip_Hide)
+	self.noteWindowLockCheck = noteWindowLockCheck
 
 	local bodyLabel = CreateFont(frame, "GameFontNormal", "Текст", "LEFT")
 	bodyLabel:SetPoint("TOPLEFT", 286, -166)
@@ -1480,6 +1158,7 @@ function DRT:CreateMainFrame()
 	bodyEdit:SetScript("OnTextChanged", function(self)
 		local height = max(self:GetHeight(), bodyScroll:GetHeight())
 		bodyContent:SetHeight(height)
+		DRT:CaptureDraft()
 	end)
 	bodyPanel:SetScript("OnMouseDown", function()
 		if bodyEdit.drtEnabled then
@@ -1534,6 +1213,7 @@ function DRT:CreateMainFrame()
 end
 
 function DRT:Toggle()
+	if not self.store then return end
 	self:CreateMainFrame()
 	if self.frame:IsShown() then
 		self.frame:Hide()
@@ -1611,260 +1291,194 @@ function DRT:CreateMinimapButton()
 	self:UpdateMinimapButtonPosition()
 end
 
-function DRT:SendRequest(channel)
-	SendPayload(BuildPayload("REQ", VERSION), channel)
+function DRT:GetGroupChannel()
+	if LE_PARTY_CATEGORY_INSTANCE and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+	if IsInRaid() then return "RAID" end
+	if IsInGroup() then return "PARTY" end
+end
+
+function DRT:QueuePayload(encoded, channel, revision)
+	if not encoded or not channel or #encoded > DRTNotes.MAX_WIRE then return end
+	self.messageSequence = (self.messageSequence or 0) + 1
+	self.outgoingQueue[#self.outgoingQueue + 1] = {
+		encoded = encoded, channel = channel, revision = revision, index = 1,
+		total = max(1, ceil(#encoded / CHUNK_SIZE)),
+		id = tostring(CurrentMillis()) .. "-" .. self.messageSequence,
+		generation = self.groupGeneration,
+	}
+	self:ScheduleAddonFlush()
+end
+
+function DRT:ScheduleAddonFlush()
+	if self.outgoingScheduled then return end
+	self.outgoingScheduled = true
+	C_Timer.After(0.35, function()
+		DRT.outgoingScheduled = false
+		DRT:FlushAddonQueue()
+	end)
+end
+
+function DRT:FlushAddonQueue()
+	local job = self.outgoingQueue[1]
+	if not job then return end
+	if not self.store or job.generation ~= self.groupGeneration or job.channel ~= self:GetGroupChannel()
+		or (job.revision and job.revision ~= self.store.profile.revision) then
+		tremove(self.outgoingQueue, 1)
+	else
+		local first = (job.index - 1) * CHUNK_SIZE + 1
+		local message = "C|" .. job.id .. "|" .. job.index .. "|" .. job.total .. "|" .. job.encoded:sub(first, first + CHUNK_SIZE - 1)
+		local result = SendAddonMessage(PREFIX, message, job.channel)
+		local results = Enum and Enum.SendAddonMessageResult
+		local throttled = results and result ~= nil and (result == results.AddonMessageThrottle or result == results.ChannelThrottle)
+		if not throttled then
+			job.index = job.index + 1
+			if job.index > job.total then
+				tremove(self.outgoingQueue, 1)
+				if job.revision and self.resendAfterFlush then
+					self.resendAfterFlush = nil
+					self:SendAllNotes()
+				end
+			end
+		end
+	end
+	if #self.outgoingQueue > 0 then self:ScheduleAddonFlush() end
 end
 
 function DRT:RequestSync()
-	if not self.playerFullName then
-		return
-	end
-
-	local channels = GetBroadcastChannels()
-	for i = 1, #channels do
-		self:SendRequest(channels[i])
-	end
+	if not self.store then return end
+	local channel = self:GetGroupChannel()
+	if not channel then return end
+	self:QueuePayload(DRTNotes.Encode(DRTNotes.Pack("REQ", { VERSION })), channel)
 end
 
-function DRT:SendAllNotes(channel, target)
-	local delay = 0
-	local ownNoteIds = {}
-	for _, note in pairs(DRTDB.notes) do
-		if type(note) == "table" and note.id and note.id ~= "" and not note.deleted and not note.localOnly and IsOwnNote(note) then
-			ownNoteIds[#ownNoteIds + 1] = tostring(note.id)
-			local payload = BuildNotePayload(note)
-			C_Timer.After(delay, function()
-				SendPayload(payload, channel, target)
-			end)
-			delay = delay + 0.06
+function DRT:SendAllNotes(requested)
+	if not self.store then return end
+	local channel = self:GetGroupChannel()
+	if not channel then return end
+	for _, job in ipairs(self.outgoingQueue) do
+		if job.revision == self.store.profile.revision and job.generation == self.groupGeneration then
+			-- A reloaded client may have missed the beginning of an in-flight snapshot.
+			if requested and job.index > 1 then self.resendAfterFlush = true end
+			return
 		end
 	end
-
-	local ownerPayload = BuildOwnerNotesPayload(self.playerFullName, ownNoteIds)
-	C_Timer.After(delay + 0.02, function()
-		SendPayload(ownerPayload, channel, target)
-	end)
-	delay = delay + 0.06
-
-	local mainPayload = BuildMainPayload()
-	C_Timer.After(delay + 0.04, function()
-		SendPayload(mainPayload, channel, target)
-	end)
+	local encoded, err = self.store:Snapshot()
+	if not encoded then Print(err); return end
+	self:QueuePayload(encoded, channel, self.store.profile.revision)
 end
 
-function DRT:HandleOwnerNotesPayload(fields)
-	local owner = NormalizeFullName(fields[1])
-	if not owner then
-		return
-	end
-	if not IsSamePlayerName(owner, self.playerFullName) and not IsCurrentGroupMember(owner) then
-		return
-	end
-
-	local activeIds = {}
-	for id in tostring(fields[2] or ""):gmatch("[^,]+") do
-		activeIds[id] = true
-	end
-
-	local changed = false
-	for key, note in pairs(DRTDB.notes) do
-		if type(note) == "table" and IsSamePlayerName(note.owner, owner) and not activeIds[tostring(note.id or "")] then
-			DRTDB.notes[key] = nil
-			changed = true
-			if self.selectedKey == key then
-				self.selectedKey = MAIN_KEY
-			end
-		end
-	end
-
-	if changed and self.frame and self.frame:IsShown() then
-		self:RefreshUI()
-	end
-end
-
-function DRT:HandleNotePayload(fields)
-	local id = fields[1]
-	local owner = NormalizeFullName(fields[2])
-	local updated = tonumber(fields[3] or 0) or 0
-	local deleted = fields[4] == "1"
-	local title = fields[5] or ""
-	local body = fields[6] or ""
-
-	if not id or id == "" or not owner then
-		return
-	end
-	if not IsSamePlayerName(owner, self.playerFullName) and not IsCurrentGroupMember(owner) then
-		return
-	end
-
-	local key = NoteKey(owner, id)
-	local existing = DRTDB.notes[key]
-	if existing and (tonumber(existing.updated or 0) or 0) >= updated then
-		return
-	end
-	if deleted then
-		if existing then
-			DRTDB.notes[key] = nil
-			if self.selectedKey == key then
-				self.selectedKey = MAIN_KEY
-			end
-			if self.frame and self.frame:IsShown() then
-				self:RefreshUI()
-			end
-		end
-		return
-	end
-
-	DRTDB.notes[key] = {
-		id = id,
-		owner = owner,
-		updated = updated,
-		title = title,
-		body = body,
-	}
-
-	if self.selectedKey == key or self.frame and self.frame:IsShown() then
-		self:RefreshUI()
-	end
-end
-
-function DRT:HandleMainPayload(fields)
-	local updated = tonumber(fields[1] or 0) or 0
-	if (tonumber(DRTDB.main.updated or 0) or 0) >= updated then
-		return
-	end
-
-	DRTDB.main.updated = updated
-	DRTDB.main.owner = NormalizeFullName(fields[2]) or fields[2] or ""
-	DRTDB.main.text = fields[3] or ""
-	self:UpdateMainNoteWindow()
-
-	if self.selectedKey == MAIN_KEY or self.frame and self.frame:IsShown() then
-		self:RefreshUI()
-	end
+function DRT:PublishNotes()
+	-- Revoking access also cancels unsent chunks containing the previous text.
+	wipe(self.outgoingQueue)
+	self.resendAfterFlush = nil
+	self:SendAllNotes()
 end
 
 function DRT:HandlePayload(sender, payload)
-	local kind, fields = ParsePayload(payload)
-	if not kind then
-		return
-	end
-
-	if kind == "REQ" then
-		if not sender or sender == "" then
-			return
-		end
-		if sender and Ambiguate and Ambiguate(sender, "none") == Ambiguate(self.playerFullName or "", "none") then
-			return
-		end
-		self:SendAllNotes("WHISPER", sender)
-	elseif kind == "NOTE" then
-		self:HandleNotePayload(fields)
-	elseif kind == "OWNER" then
-		self:HandleOwnerNotesPayload(fields)
-	elseif kind == "MAIN" then
-		self:HandleMainPayload(fields)
+	if not self.store or not IsCurrentGroupMember(sender) or IsSamePlayerName(sender, self.playerFullName) then return end
+	local kind, fields = DRTNotes.Unpack(payload)
+	if kind == "REQ" and #fields == 1 then
+		local now = GetTime()
+		if self.responsePending then return end
+		self.responsePending = true
+		local generation = self.groupGeneration
+		C_Timer.After(max(0, 2 - (now - (self.lastResponse or -10))), function()
+			if generation ~= DRT.groupGeneration then return end
+			DRT.responsePending = nil
+			DRT.lastResponse = GetTime()
+			DRT:SendAllNotes(true)
+		end)
+	elseif kind == "SNAP" then
+		if self.store:Apply(sender, fields, IsCurrentGroupMember) then self:RefreshRemoteUI() end
 	end
 end
 
 function DRT:HandleAddonMessage(prefix, message, channel, sender)
-	if prefix ~= PREFIX or not message then
-		return
+	if prefix ~= PREFIX or not self.store or type(message) ~= "string" or #message > 255
+		or channel ~= self:GetGroupChannel() then return end
+	sender = NormalizeFullName(sender)
+	if not sender or IsSamePlayerName(sender, self.playerFullName) or not IsCurrentGroupMember(sender) then return end
+	local id, index, total, part = message:match("^C|([%w%-]+)|(%d+)|(%d+)|(.*)$")
+	index, total = tonumber(index), tonumber(total)
+	if not id or #id > 64 or not index or not total or total < 1
+		or total > ceil(DRTNotes.MAX_WIRE / CHUNK_SIZE) or index < 1 or index > total
+		or #part > CHUNK_SIZE then return end
+	local now = GetTime()
+	for owner, buffer in pairs(self.incomingChunks) do
+		if now - buffer.last > 60 then self.incomingChunks[owner] = nil end
 	end
-
-	if sender and Ambiguate and self.playerFullName and Ambiguate(sender, "none") == Ambiguate(self.playerFullName, "none") then
-		return
+	local buffer = self.incomingChunks[sender]
+	if not buffer or buffer.id ~= id then
+		if index ~= 1 then return end
+		buffer = { id = id, total = total, parts = {}, received = 0, bytes = 0, last = now }
+		self.incomingChunks[sender] = buffer
 	end
-
-	local tag, id, index, total, part = SplitChunkMessage(message)
-	if tag ~= "C" or not id or not index or not total or not part then
-		return
-	end
-
-	local buffer = self.incomingChunks[id]
-	if not buffer then
-		buffer = {
-			total = total,
-			received = 0,
-			parts = {},
-			started = GetTime(),
-		}
-		self.incomingChunks[id] = buffer
-	end
-
+	if buffer.total ~= total then self.incomingChunks[sender] = nil; return end
+	if buffer.parts[index] and buffer.parts[index] ~= part then self.incomingChunks[sender] = nil; return end
+	buffer.last = now
 	if not buffer.parts[index] then
 		buffer.parts[index] = part
 		buffer.received = buffer.received + 1
+		buffer.bytes = buffer.bytes + #part
 	end
-
-	if buffer.received >= buffer.total then
-		local encoded = ""
-		for i = 1, buffer.total do
-			if not buffer.parts[i] then
-				return
-			end
-			encoded = encoded .. buffer.parts[i]
-		end
-		self.incomingChunks[id] = nil
-		self:HandlePayload(sender, Decode(encoded))
-	end
-
-	local now = GetTime()
-	for chunkId, chunk in pairs(self.incomingChunks) do
-		if now - (chunk.started or now) > 30 then
-			self.incomingChunks[chunkId] = nil
-		end
+	if buffer.bytes > DRTNotes.MAX_WIRE then self.incomingChunks[sender] = nil; return end
+	if buffer.received == total then
+		self.incomingChunks[sender] = nil
+		local payload = DRTNotes.Decode(table.concat(buffer.parts))
+		if payload then self:HandlePayload(sender, payload) end
 	end
 end
 
 function DRT:HandleGroupChange()
-	local grouped = IsInGroup()
-	if self.wasGrouped == nil then
-		self.wasGrouped = grouped
+	if not self.store then return end
+	local members = {}
+	for _, player in ipairs(self:GetRoster()) do members[#members + 1] = player.name end
+	sort(members)
+	local signature = (self:GetGroupChannel() or "") .. ":" .. table.concat(members, ",")
+	if signature == self.groupSignature then
+		self:RefreshPlayerButtons()
 		return
 	end
-
-	if grouped and not self.wasGrouped then
-		C_Timer.After(0.6, function()
-			if IsInGroup() and UnitIsGroupLeader("player") then
-				DRT:ClearMainNote(true)
-			end
-			DRT:RequestSync()
-			DRT:RefreshPlayerButtons()
-		end)
-	elseif not grouped and self.wasGrouped then
-		self:PruneForeignNotes()
-		self:RefreshPlayerButtons()
-		if self.frame and self.frame:IsShown() then
-			self:RefreshUI()
-		end
-	elseif grouped then
-		local changed = self:PruneForeignNotes(true)
-		self:RefreshPlayerButtons()
-		if changed and self.frame and self.frame:IsShown() then
-			self:RefreshUI()
-		end
-	end
-
-	self.wasGrouped = grouped
+	self.groupSignature = signature
+	self.groupGeneration = (self.groupGeneration or 0) + 1
+	wipe(self.outgoingQueue)
+	wipe(self.incomingChunks)
+	self.lastResponse = nil
+	self.responsePending, self.resendAfterFlush = nil, nil
+	self:PruneForeignNotes()
+	self:RefreshRemoteUI()
+	self:RefreshPlayerButtons()
+	local generation = self.groupGeneration
+	C_Timer.After(0.6, function()
+		if DRT.groupGeneration ~= generation then return end
+		DRT:RequestSync()
+		DRT:SendAllNotes()
+	end)
 end
 
 function DRT:OnLogin()
-	EnsureDB()
+	if self.store then return end
 	self.realmName = NormalizeRealm(GetRealmName())
 	self.playerFullName = UnitFullNameSafe("player")
-	self.wasGrouped = IsInGroup()
-	self:PruneForeignNotes(self.wasGrouped)
-
-	if RegisterAddonMessagePrefix then
-		RegisterAddonMessagePrefix(PREFIX)
+	local guid = UnitGUID("player")
+	if not guid or not self.playerFullName then
+		C_Timer.After(1, function() DRT:OnLogin() end)
+		return
 	end
-
+	EnsureDB()
+	self.store = DRTNotes.Open(DRTDB, guid, self.playerFullName, self.realmName, CurrentMillis())
+	DRTDB.noteWindow = type(DRTDB.noteWindow) == "table" and DRTDB.noteWindow or {}
+	local window = DRTDB.noteWindow
+	window.enabled, window.locked = window.enabled == true, window.locked == true
+	window.width = min(800, max(NOTE_WINDOW_MIN_WIDTH, tonumber(window.width) or NOTE_WINDOW_DEFAULT_WIDTH))
+	window.height = min(600, max(NOTE_WINDOW_MIN_HEIGHT, tonumber(window.height) or NOTE_WINDOW_DEFAULT_HEIGHT))
+	window.left, window.top = tonumber(window.left), tonumber(window.top)
+	-- Each character remembers which note is pinned; geometry remains account-wide.
+	window.key = self.store.profile.windowKey
+	if RegisterAddonMessagePrefix then RegisterAddonMessagePrefix(PREFIX) end
 	self:CreateMinimapButton()
-	self:UpdateMainNoteWindow()
-	C_Timer.After(1.5, function()
-		DRT:RequestSync()
-	end)
+	self:UpdateNoteWindow()
+	self:HandleGroupChange()
 end
 
 DRT:SetScript("OnEvent", function(self, event, ...)
@@ -1874,31 +1488,26 @@ DRT:SetScript("OnEvent", function(self, event, ...)
 		self:HandleAddonMessage(...)
 	elseif event == "GROUP_ROSTER_UPDATE" then
 		self:HandleGroupChange()
-	elseif event == "PLAYER_GUILD_UPDATE" then
-		self:RequestSync()
 	end
 end)
 
 DRT:RegisterEvent("PLAYER_LOGIN")
 DRT:RegisterEvent("CHAT_MSG_ADDON")
 DRT:RegisterEvent("GROUP_ROSTER_UPDATE")
-DRT:RegisterEvent("PLAYER_GUILD_UPDATE")
 
 SLASH_DRT1 = "/drt"
 SLASH_DRT2 = "/дрт"
 SlashCmdList.DRT = function(msg)
+	if not DRT.store then return end
 	msg = Trim(msg):lower()
 	if msg == "sync" then
 		DRT:RequestSync()
 		Print("запрошена синхронизация.")
-	elseif msg == "clear" then
-		DRT:ClearMainNote(true)
-		Print("главная заметка очищена.")
 	else
 		DRT:Toggle()
 	end
 end
 
 function DRT_Toggle()
-	DRT:Toggle()
+	if DRT.store then DRT:Toggle() end
 end
